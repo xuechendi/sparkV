@@ -17,6 +17,7 @@
 package org.apache.spark.sql.vectorized;
 
 import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.spark.annotation.Evolving;
 import org.apache.spark.sql.catalyst.InternalRow;
@@ -25,6 +26,9 @@ import org.apache.spark.sql.types.*;
 import org.apache.spark.unsafe.types.CalendarInterval;
 import org.apache.spark.unsafe.types.UTF8String;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 /**
  * This class wraps multiple ColumnVectors as a row-wise table. It provides a row view of this
  * batch so that Spark can access the data row by row. Instance of it is meant to be reused during
@@ -32,8 +36,11 @@ import org.apache.spark.unsafe.types.UTF8String;
  */
 @Evolving
 public final class ColumnarBatch implements AutoCloseable {
+  private static final Logger LOG = LoggerFactory.getLogger(ColumnarBatch.class);
   private int numRows;
   private final ColumnVector[] columns;
+  private Object taskAttemptId;
+  private final AtomicInteger refCnt = new AtomicInteger(0);
 
   // Staging row returned from `getRow`.
   private final ColumnarBatchRow row;
@@ -44,9 +51,16 @@ public final class ColumnarBatch implements AutoCloseable {
    */
   @Override
   public void close() {
-    for (ColumnVector c: columns) {
-      c.close();
+    final int curRefCnt = refCnt.addAndGet(-1);
+    if (curRefCnt == 0) {
+      for (ColumnVector c: columns) {
+        c.close();
+      }
     }
+  }
+
+  public void retain() {
+    refCnt.addAndGet(1);
   }
 
   /**
@@ -96,6 +110,8 @@ public final class ColumnarBatch implements AutoCloseable {
    */
   public int numRows() { return numRows; }
 
+  public Object taskId() { return taskAttemptId; }
+
   /**
    * Returns the column at `ordinal`.
    */
@@ -123,6 +139,15 @@ public final class ColumnarBatch implements AutoCloseable {
     this.columns = columns;
     this.numRows = numRows;
     this.row = new ColumnarBatchRow(columns);
+    retain();
+  }
+
+  public ColumnarBatch(ColumnVector[] columns, int numRows, Object taskAttemptId) {
+    this.columns = columns;
+    this.numRows = numRows;
+    this.taskAttemptId = taskAttemptId;
+    this.row = new ColumnarBatchRow(columns);
+    retain();
   }
 }
 

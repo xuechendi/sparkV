@@ -20,6 +20,7 @@ package org.apache.spark.sql.execution
 import scala.collection.JavaConverters._
 
 import org.apache.spark.{broadcast, TaskContext}
+import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, SortOrder, SpecializedGetters, UnsafeProjection}
@@ -28,7 +29,7 @@ import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
-import org.apache.spark.sql.execution.vectorized.{OffHeapColumnVector, OnHeapColumnVector, WritableColumnVector}
+import org.apache.spark.sql.execution.vectorized.{ArrowWritableColumnVector, OffHeapColumnVector, OnHeapColumnVector, WritableColumnVector}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
@@ -314,7 +315,11 @@ private object RowToColumnConverter {
   private object StringConverter extends TypeConverter {
     override def append(row: SpecializedGetters, column: Int, cv: WritableColumnVector): Unit = {
       val data = row.getUTF8String(column).getBytes
-      cv.appendByteArray(data, 0, data.length)
+      if (cv.isInstanceOf[ArrowWritableColumnVector]) {
+        cv.asInstanceOf[ArrowWritableColumnVector].appendString(data, 0, data.length);
+      } else {
+        cv.appendByteArray(data, 0, data.length)
+      }
     }
   }
 
@@ -426,6 +431,7 @@ case class RowToColumnarExec(child: SparkPlan) extends UnaryExecNode {
 
   override def doExecuteColumnar(): RDD[ColumnarBatch] = {
     val enableOffHeapColumnVector = sqlContext.conf.offHeapColumnVectorEnabled
+    val enableArrowColumnVector = sqlContext.conf.arrowColumnVectorEnabled
     val numInputRows = longMetric("numInputRows")
     val numOutputBatches = longMetric("numOutputBatches")
     // Instead of creating a new config we are reusing columnBatchSize. In the future if we do
@@ -434,19 +440,18 @@ case class RowToColumnarExec(child: SparkPlan) extends UnaryExecNode {
     // This avoids calling `schema` in the RDD closure, so that we don't need to include the entire
     // plan (this) in the closure.
     val localSchema = this.schema
-    child.execute().mapPartitionsInternal { rowIterator =>
+    child.execute().mapPartitions { rowIterator =>
       if (rowIterator.hasNext) {
         new Iterator[ColumnarBatch] {
           private val converters = new RowToColumnConverter(localSchema)
-          private val vectors: Seq[WritableColumnVector] = if (enableOffHeapColumnVector) {
-            OffHeapColumnVector.allocateColumns(numRows, localSchema)
-          } else {
-            OnHeapColumnVector.allocateColumns(numRows, localSchema)
-          }
-          private val cb: ColumnarBatch = new ColumnarBatch(vectors.toArray)
+          var cb: ColumnarBatch = null
 
           TaskContext.get().addTaskCompletionListener[Unit] { _ =>
-            cb.close()
+            if (cb != null) {
+              cb.close()
+              cb = null
+            }
+
           }
 
           override def hasNext: Boolean = {
@@ -454,15 +459,27 @@ case class RowToColumnarExec(child: SparkPlan) extends UnaryExecNode {
           }
 
           override def next(): ColumnarBatch = {
-            cb.setNumRows(0)
-            vectors.foreach(_.reset())
+            if (cb != null) {
+              cb.close()
+              cb = null
+            }
+            val columnVectors : Array[WritableColumnVector] =
+              if (enableArrowColumnVector) {
+                logInfo(s"using arrow vector")
+                ArrowWritableColumnVector.allocateColumns(numRows, schema).toArray
+              } else if (enableOffHeapColumnVector) {
+                OffHeapColumnVector.allocateColumns(numRows, schema).toArray
+              } else {
+                OnHeapColumnVector.allocateColumns(numRows, schema).toArray
+              }
+
             var rowCount = 0
             while (rowCount < numRows && rowIterator.hasNext) {
               val row = rowIterator.next()
-              converters.convert(row, vectors.toArray)
+              converters.convert(row, columnVectors)
               rowCount += 1
             }
-            cb.setNumRows(rowCount)
+            cb = new ColumnarBatch(columnVectors.toArray, rowCount)
             numInputRows += rowCount
             numOutputBatches += 1
             cb
@@ -480,7 +497,7 @@ case class RowToColumnarExec(child: SparkPlan) extends UnaryExecNode {
  * to/from columnar formatted data.
  */
 case class ApplyColumnarRulesAndInsertTransitions(conf: SQLConf, columnarRules: Seq[ColumnarRule])
-  extends Rule[SparkPlan] {
+  extends Rule[SparkPlan] with Logging {
 
   /**
    * Inserts an transition to columnar formatted data.
